@@ -1,6 +1,7 @@
 import math
 from typing import Annotated
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.database.session import get_db
@@ -11,14 +12,18 @@ from app.schemas.camera import (
     CameraResponse,
     CameraDetailResponse,
     WorkstationZoneSummary,
+    CameraHeartbeat,
+    CameraHeartbeatBatch,
 )
 from app.schemas.common import PaginatedResponse
 from app.api.deps import (
     require_viewer,
+    require_operator,
     require_location_admin,
     has_location_access,
 )
 from app.services import camera_service
+from app.services.edge_bridge_service import edge_bridge_service
 
 router = APIRouter()
 
@@ -209,4 +214,145 @@ def list_camera_zones(
         )
 
     return [WorkstationZoneSummary.model_validate(z) for z in camera.workstation_zones]
+
+
+@router.post(
+    "/heartbeat/batch",
+    status_code=status.HTTP_200_OK,
+    summary="Batch update camera connectivity heartbeats",
+    description="Receive batched camera heartbeat telemetry from Edge Ingestion Service and update PostgreSQL connection statuses.",
+)
+def batch_camera_heartbeat(
+    batch_data: CameraHeartbeatBatch,
+    current_user: Annotated[User, Depends(require_operator)],
+    db: Annotated[Session, Depends(get_db)],
+) -> dict[str, int]:
+    updated_count = camera_service.record_batch_heartbeats(db=db, batch_data=batch_data)
+    return {"updated": updated_count}
+
+
+@router.post(
+    "/{camera_id}/heartbeat",
+    response_model=CameraResponse,
+    summary="Update camera connectivity heartbeat",
+    description="Receive connection state and telemetry from Edge Ingestion Service, updating connection status and heartbeat timestamp.",
+)
+def camera_heartbeat(
+    camera_id: int,
+    heartbeat_data: CameraHeartbeat,
+    current_user: Annotated[User, Depends(require_operator)],
+    db: Annotated[Session, Depends(get_db)],
+) -> CameraResponse:
+    camera = camera_service.get_camera_by_id(db=db, camera_id=camera_id)
+    if not camera:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Camera with ID {camera_id} not found.",
+        )
+    updated = camera_service.record_camera_heartbeat(
+        db=db, camera_id=camera_id, heartbeat_data=heartbeat_data
+    )
+    return CameraResponse.model_validate(updated)
+
+
+@router.get(
+    "/{camera_id}/snapshot",
+    summary="Retrieve live JPEG camera snapshot",
+    description="Fetch a fresh decoded JPEG frame from the Edge Ingestion Service buffer. Enforces location RBAC and verifies active status without opening a duplicate RTSP connection.",
+    responses={
+        200: {"content": {"image/jpeg": {}}, "description": "Fresh camera JPEG snapshot"},
+        400: {"description": "Camera is deactivated"},
+        403: {"description": "Location access denied"},
+        404: {"description": "Camera not found"},
+        503: {"description": "Camera stream is offline or edge service is unreachable"},
+    },
+)
+async def get_camera_snapshot(
+    camera_id: int,
+    current_user: Annotated[User, Depends(require_viewer)],
+    db: Annotated[Session, Depends(get_db)],
+    quality: Annotated[int, Query(ge=30, le=100, description="JPEG compression quality")] = 80,
+    max_age: Annotated[float, Query(ge=0.5, le=30.0, description="Max frame age in seconds")] = 5.0,
+):
+    camera = camera_service.get_camera_by_id(db=db, camera_id=camera_id)
+    if not camera:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Camera with ID {camera_id} not found.",
+        )
+
+    if not has_location_access(db=db, user=current_user, location_id=camera.location_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Access denied: You are not authorized for camera location ID {camera.location_id}.",
+        )
+
+    if not camera.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Camera '{camera.camera_code}' is deactivated. Activate camera to retrieve snapshots.",
+        )
+
+    jpeg_bytes, headers = await edge_bridge_service.get_snapshot(
+        camera_id=camera_id,
+        quality=quality,
+        max_age=max_age,
+    )
+
+    return Response(content=jpeg_bytes, media_type="image/jpeg", headers=headers)
+
+
+@router.get(
+    "/{camera_id}/stream",
+    summary="Live MJPEG video stream",
+    description="Streams multipart/x-mixed-replace JPEG frames directly from the Edge Ingestion Service. Reuses decoded RTSP worker frames without duplicating connections.",
+    responses={
+        200: {"content": {"multipart/x-mixed-replace; boundary=frame": {}}, "description": "MJPEG video stream"},
+        400: {"description": "Camera is deactivated"},
+        403: {"description": "Location access denied"},
+        404: {"description": "Camera not found"},
+        429: {"description": "Maximum concurrent stream viewers exceeded"},
+        503: {"description": "Camera stream is offline or edge service unreachable"},
+    },
+)
+async def get_camera_stream(
+    camera_id: int,
+    current_user: Annotated[User, Depends(require_viewer)],
+    db: Annotated[Session, Depends(get_db)],
+    fps: Annotated[int, Query(ge=1, le=30, description="Target frame rate")] = 15,
+    quality: Annotated[int, Query(ge=30, le=95, description="JPEG quality")] = 75,
+    max_frames: Annotated[int | None, Query(ge=1, description="Optional max frames limit")] = None,
+):
+    camera = camera_service.get_camera_by_id(db=db, camera_id=camera_id)
+    if not camera:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Camera with ID {camera_id} not found.",
+        )
+
+    if not has_location_access(db=db, user=current_user, location_id=camera.location_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Access denied: You are not authorized for camera location ID {camera.location_id}.",
+        )
+
+    if not camera.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Camera '{camera.camera_code}' is deactivated. Activate camera to view live stream.",
+        )
+
+    headers = {
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "Pragma": "no-cache",
+        "X-Camera-ID": str(camera.id),
+        "X-Camera-Code": camera.camera_code,
+    }
+
+    return StreamingResponse(
+        edge_bridge_service.stream_mjpeg(camera_id=camera_id, fps=fps, quality=quality, max_frames=max_frames),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+        headers=headers,
+    )
+
 

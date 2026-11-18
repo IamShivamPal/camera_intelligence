@@ -1,6 +1,6 @@
 import math
 from datetime import datetime
-from typing import Annotated
+from typing import Annotated, Any
 from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.orm import Session
 
@@ -107,3 +107,31 @@ def get_event_details(
         event_id=event_id,
     )
     return event_service.format_detection_event_detail(event)
+
+
+@router.post(
+    "/reconcile-sessions",
+    status_code=status.HTTP_200_OK,
+    summary="Reconcile orphaned presence sessions",
+    description="Scan and close open presence sessions associated with offline cameras or stale heartbeats.",
+)
+def reconcile_sessions(
+    current_user: Annotated[User, Depends(require_operator)],
+    db: Annotated[Session, Depends(get_db)],
+    max_stale_seconds: Annotated[float, Query(ge=1.0, description="Session idle threshold in seconds")] = 900.0,
+    offline_camera_grace_seconds: Annotated[float, Query(ge=1.0, description="Camera offline grace period in seconds")] = 60.0,
+    location_id: Annotated[int | None, Query(description="Filter reconciliation by location ID")] = None,
+    camera_id: Annotated[int | None, Query(description="Filter reconciliation by camera ID")] = None,
+) -> dict[str, Any]:
+    closed = event_service.reconcile_stale_presence_sessions(
+        db=db,
+        max_stale_seconds=max_stale_seconds,
+        offline_camera_grace_seconds=offline_camera_grace_seconds,
+        location_id=location_id,
+        camera_id=camera_id,
+    )
+    return {
+        "status": "success",
+        "reconciled_sessions_count": len(closed),
+        "reconciled_session_ids": [s.id for s in closed],
+    }

@@ -64,6 +64,8 @@ class TestAuthAndAuthorization(unittest.TestCase):
             cls.db.query(User).filter(User.email == cls.admin_email).first()
         )
         assert cls.admin_user is not None, "Bootstrap super_admin not found in database!"
+        cls.admin_user.password_hash = get_password_hash(cls.admin_password)
+        cls.db.commit()
 
         # Create temporary test locations
         cls.loc_a = Location(

@@ -1,4 +1,5 @@
 import logging
+from typing import Any
 from datetime import datetime, timezone
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -21,6 +22,47 @@ from app.core.permissions import SystemRole, has_minimum_role
 from app.api.deps import has_location_access
 
 logger = logging.getLogger(__name__)
+
+
+def _accumulate_workstation_duration(
+    session: PresenceSession,
+    event_time: datetime,
+    event_type: str,
+    meta: dict[str, Any],
+) -> None:
+    """
+    Safely accumulates active_seconds and idle_seconds on PresenceSession.
+    Guarantees:
+      - Protects against negative durations and out-of-order timestamps (event_time <= session.last_seen_at).
+      - Handles ACTIVE -> IDLE and IDLE -> ACTIVE transitions.
+      - Uses metadata inactivity duration when transitioning to IDLE if provided.
+      - Ensures active_seconds >= 0 and idle_seconds >= 0 (satisfies database check constraints).
+    """
+    if session.active_seconds is None:
+        session.active_seconds = 0
+    if session.idle_seconds is None:
+        session.idle_seconds = 0
+
+    if event_time <= session.last_seen_at:
+        return
+
+    delta_seconds = max(0.0, (event_time - session.last_seen_at).total_seconds())
+    if delta_seconds <= 0:
+        return
+
+    prev_status = session.status  # "active" or "idle"
+
+    if prev_status == "idle":
+        session.idle_seconds += int(round(delta_seconds))
+    else:
+        if event_type == "workstation_idle" and not meta.get("is_departure") and "inactivity_duration_seconds" in meta:
+            idle_reported = float(meta["inactivity_duration_seconds"])
+            idle_chunk = min(delta_seconds, max(0.0, idle_reported))
+            active_chunk = max(0.0, delta_seconds - idle_chunk)
+            session.active_seconds += int(round(active_chunk))
+            session.idle_seconds += int(round(idle_chunk))
+        else:
+            session.active_seconds += int(round(delta_seconds))
 
 
 def process_presence_on_event(
@@ -77,6 +119,13 @@ def process_presence_on_event(
         "workstation_active",
         "workstation_idle",
     ):
+        meta = event.metadata_json or {}
+        is_departure = (
+            meta.get("action") == "exit"
+            or meta.get("current_state") == "vacant"
+            or meta.get("is_departure") is True
+        )
+
         ws_session = (
             db.query(PresenceSession)
             .filter(
@@ -87,14 +136,45 @@ def process_presence_on_event(
             )
             .first()
         )
-        if ws_session is None and event.event_type == "workstation_active":
+
+        # Handle explicit departure from workstation zone
+        if is_departure:
+            if ws_session is not None:
+                _accumulate_workstation_duration(ws_session, event.occurred_at, event.event_type, meta)
+                ws_session.ended_at = event.occurred_at
+                ws_session.status = "closed"
+                if event.occurred_at > ws_session.last_seen_at:
+                    ws_session.last_seen_at = event.occurred_at
+                event.presence_session_id = ws_session.id
+                return ws_session
+            return None
+
+        # Create session if none exists and not a departure
+        if ws_session is None and (event.event_type == "workstation_active" or not is_departure):
+            # Close any prior open workstation sessions for this employee in other zones
+            prior_open = (
+                db.query(PresenceSession)
+                .filter(
+                    PresenceSession.employee_id == event.employee_id,
+                    PresenceSession.session_type == "workstation",
+                    PresenceSession.ended_at.is_(None),
+                )
+                .all()
+            )
+            for prior in prior_open:
+                _accumulate_workstation_duration(prior, event.occurred_at, "workstation_idle", {"is_departure": True})
+                prior.ended_at = event.occurred_at
+                if event.occurred_at > prior.last_seen_at:
+                    prior.last_seen_at = event.occurred_at
+                prior.status = "closed"
+
             new_ws = PresenceSession(
                 employee_id=event.employee_id,
                 location_id=event.location_id,
                 entry_camera_id=event.camera_id,
                 workstation_zone_id=event.workstation_zone_id,
                 session_type="workstation",
-                status="active",
+                status="active" if event.event_type == "workstation_active" else "idle",
                 started_at=event.occurred_at,
                 last_seen_at=event.occurred_at,
                 active_seconds=0,
@@ -106,11 +186,104 @@ def process_presence_on_event(
             event.presence_session_id = new_ws.id
             return new_ws
         elif ws_session is not None:
+            _accumulate_workstation_duration(ws_session, event.occurred_at, event.event_type, meta)
             if event.occurred_at > ws_session.last_seen_at:
                 ws_session.last_seen_at = event.occurred_at
             ws_session.status = "active" if event.event_type == "workstation_active" else "idle"
             event.presence_session_id = ws_session.id
             return ws_session
+
+    return None
+
+
+def reconcile_stale_presence_sessions(
+    db: Session,
+    max_stale_seconds: float = 900.0,
+    offline_camera_grace_seconds: float = 60.0,
+    location_id: int | None = None,
+    camera_id: int | None = None,
+    reference_time: datetime | None = None,
+) -> list[PresenceSession]:
+    """
+    Reconciles orphaned and stale open workstation presence sessions.
+
+    Eligibility criteria (idempotent, safe):
+    1. Session is currently open: session_type = 'workstation' and ended_at IS NULL.
+    2. Camera Offline or Stale Heartbeat:
+       - Associated camera has connection_status in ('offline', 'unknown') or is_active = False,
+         and has been offline/stale for >= offline_camera_grace_seconds.
+       - OR the session's last_seen_at is older than max_stale_seconds with no recent camera heartbeat.
+
+    Actions on eligible sessions:
+    - Sets ended_at = last_seen_at (preserves accumulated duration, prevents phantom time).
+    - Sets status = 'closed'.
+    - Commits and returns the closed sessions.
+    """
+    now = reference_time or datetime.now(timezone.utc)
+    closed_sessions: list[PresenceSession] = []
+
+    query = (
+        db.query(PresenceSession, Camera)
+        .join(WorkstationZone, PresenceSession.workstation_zone_id == WorkstationZone.id)
+        .join(Camera, WorkstationZone.camera_id == Camera.id)
+        .filter(
+            PresenceSession.session_type == "workstation",
+            PresenceSession.ended_at.is_(None),
+        )
+    )
+
+    if location_id is not None:
+        query = query.filter(PresenceSession.location_id == location_id)
+    if camera_id is not None:
+        query = query.filter(Camera.id == camera_id)
+
+    results = query.all()
+
+    for ws_session, cam in results:
+        is_eligible = False
+
+        # Calculate ages
+        last_seen = ws_session.last_seen_at
+        if last_seen.tzinfo is None:
+            last_seen = last_seen.replace(tzinfo=timezone.utc)
+        seen_age = max(0.0, (now - last_seen).total_seconds())
+
+        cam_hb = cam.last_heartbeat_at
+        if cam_hb is not None and cam_hb.tzinfo is None:
+            cam_hb = cam_hb.replace(tzinfo=timezone.utc)
+        hb_age = (now - cam_hb).total_seconds() if cam_hb is not None else 999999.0
+
+        # Criterion 1: Camera explicitly marked inactive
+        if not cam.is_active:
+            is_eligible = True
+        # Criterion 2: Camera reported offline or unknown beyond offline grace period
+        elif cam.connection_status in ("offline", "unknown"):
+            if seen_age >= offline_camera_grace_seconds or hb_age >= offline_camera_grace_seconds:
+                is_eligible = True
+        # Criterion 3: Session completely stale (exceeding max_stale_seconds) without fresh camera heartbeat
+        elif seen_age >= max_stale_seconds:
+            if hb_age >= offline_camera_grace_seconds:
+                is_eligible = True
+
+        if is_eligible:
+            ws_session.ended_at = ws_session.last_seen_at
+            ws_session.status = "closed"
+            closed_sessions.append(ws_session)
+            logger.info(
+                "Reconciled stale workstation session ID %d (emp=%d, zone=%d, cam=%d) ended_at=%s",
+                ws_session.id,
+                ws_session.employee_id,
+                ws_session.workstation_zone_id,
+                cam.id,
+                ws_session.ended_at,
+            )
+
+    if closed_sessions:
+        db.commit()
+        for s in closed_sessions:
+            db.refresh(s)
+
+    return closed_sessions
 
     return None
 

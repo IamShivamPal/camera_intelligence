@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Camera Intelligence — Master Development & Operations Controller
+    Camera Intelligence -- Master Development & Operations Controller
 
 .DESCRIPTION
     Unified CLI script for running, testing, managing, and bootstrapping:
@@ -37,10 +37,12 @@ $ServerDir = Join-Path $RootDir "server"
 $ClientDir = Join-Path $RootDir "client"
 $AIEngineDir = Join-Path $RootDir "ai_engine"
 
-# Virtual environment python and executable paths
-$ServerPy = Join-Path $ServerDir ".venv\Scripts\python.exe"
-$ServerAlembic = Join-Path $ServerDir ".venv\Scripts\alembic.exe"
-$AIPy = Join-Path $AIEngineDir ".venv\Scripts\python.exe"
+# Virtual environment python and executable paths (with fallback to active Python)
+$ServerVenvPy = Join-Path $ServerDir ".venv\Scripts\python.exe"
+$ServerPy = if (Test-Path $ServerVenvPy) { $ServerVenvPy } else { (Get-Command python.exe -ErrorAction SilentlyContinue).Source }
+$ServerAlembic = if (Test-Path (Join-Path $ServerDir ".venv\Scripts\alembic.exe")) { Join-Path $ServerDir ".venv\Scripts\alembic.exe" } else { "alembic" }
+$AIVenvPy = Join-Path $AIEngineDir ".venv\Scripts\python.exe"
+$AIPy = if (Test-Path $AIVenvPy) { $AIVenvPy } else { (Get-Command python.exe -ErrorAction SilentlyContinue).Source }
 
 # Helper print functions
 function Write-Header {
@@ -70,7 +72,7 @@ function Write-ErrorMsg {
 # -------------------------------------------------------------
 
 function Invoke-Help {
-    Write-Header "Camera Intelligence — Master Command Runner"
+    Write-Header "Camera Intelligence -- Master Command Runner"
     Write-Host "Usage: .\run.ps1 <command> [options]`n" -ForegroundColor White
 
     Write-Host "--- BACKEND COMMANDS ---" -ForegroundColor Yellow
@@ -124,8 +126,8 @@ function Invoke-Help {
 
 function Invoke-Backend {
     Write-Header "Starting FastAPI Backend Server (Development Mode)"
-    if (-not (Test-Path $ServerPy)) {
-        Write-ErrorMsg "Backend virtual environment not found at server/.venv"
+    if (-not $ServerPy) {
+        Write-ErrorMsg "Python executable not found in PATH or server/.venv"
         exit 1
     }
     Write-Info "Server running at: http://127.0.0.1:8000"
@@ -137,8 +139,8 @@ function Invoke-Backend {
 
 function Invoke-BackendProd {
     Write-Header "Starting FastAPI Backend Server (Production Mode)"
-    if (-not (Test-Path $ServerPy)) {
-        Write-ErrorMsg "Backend virtual environment not found at server/.venv"
+    if (-not $ServerPy) {
+        Write-ErrorMsg "Python executable not found in PATH or server/.venv"
         exit 1
     }
     Write-Info "Binding to 0.0.0.0:8000 with 4 workers..."
@@ -206,8 +208,8 @@ function Invoke-FrontendBuild {
 
 function Invoke-DbCheck {
     Write-Header "Checking PostgreSQL Database Connectivity & Tables"
-    if (-not (Test-Path $ServerPy)) {
-        Write-ErrorMsg "Backend venv not found."
+    if (-not $ServerPy) {
+        Write-ErrorMsg "Python executable not found in PATH or server/.venv"
         exit 1
     }
     $code = @"

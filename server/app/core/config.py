@@ -17,6 +17,11 @@ class Settings(BaseSettings):
     DATABASE_URL: str
     CORS_ORIGINS: Annotated[list[str], NoDecode] = ["http://localhost:5173"]
 
+    # Edge Frame Server & Streaming Bridge settings
+    EDGE_FRAME_SERVER_URL: str = "http://127.0.0.1:8001"
+    EDGE_FRAME_TIMEOUT_SECONDS: float = 5.0
+    MAX_STREAM_VIEWERS_PER_CAMERA: int = 10
+
     # JWT Authentication settings (configurable via environment variables)
     JWT_SECRET_KEY: str = (
         "dev-insecure-jwt-secret-key-camera-intelligence-change-in-prod-2026"

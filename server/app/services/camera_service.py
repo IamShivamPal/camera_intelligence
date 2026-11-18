@@ -15,6 +15,8 @@ from app.schemas.camera import (
     CameraResponse,
     CameraDetailResponse,
     WorkstationZoneSummary,
+    CameraHeartbeat,
+    CameraHeartbeatBatch,
 )
 from app.core.permissions import SystemRole, has_minimum_role
 from app.api.deps import has_location_access
@@ -384,3 +386,59 @@ def associate_workstation_zone(
         camera.id,
     )
     return zone
+
+
+def record_camera_heartbeat(
+    db: Session,
+    camera_id: int,
+    heartbeat_data: CameraHeartbeat,
+) -> Camera:
+    """Update camera connection status and last_heartbeat_at timestamp."""
+    camera = get_camera_by_id(db, camera_id)
+    if not camera:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Camera with ID {camera_id} not found.",
+        )
+    camera.connection_status = heartbeat_data.connection_status
+    camera.last_heartbeat_at = func.now()
+    db.commit()
+    db.refresh(camera)
+
+    if camera.connection_status in ("offline", "unknown"):
+        try:
+            from app.services.event_service import reconcile_stale_presence_sessions
+            reconcile_stale_presence_sessions(db, camera_id=camera.id, offline_camera_grace_seconds=60.0)
+        except Exception as e:
+            logger.debug("Error during camera heartbeat session reconciliation: %s", e)
+
+    return camera
+
+
+def record_batch_heartbeats(
+    db: Session,
+    batch_data: CameraHeartbeatBatch,
+) -> int:
+    """Batch update multiple cameras' connection status and last_heartbeat_at timestamp."""
+    updated_count = 0
+    now_expr = func.now()
+    offline_cam_ids = []
+    for item in batch_data.items:
+        cam = db.query(Camera).filter(Camera.id == item.camera_id).first()
+        if cam:
+            cam.connection_status = item.connection_status
+            cam.last_heartbeat_at = now_expr
+            updated_count += 1
+            if item.connection_status in ("offline", "unknown"):
+                offline_cam_ids.append(cam.id)
+    if updated_count > 0:
+        db.commit()
+        if offline_cam_ids:
+            try:
+                from app.services.event_service import reconcile_stale_presence_sessions
+                for cid in offline_cam_ids:
+                    reconcile_stale_presence_sessions(db, camera_id=cid, offline_camera_grace_seconds=60.0)
+            except Exception as e:
+                logger.debug("Error during batch heartbeat session reconciliation: %s", e)
+    return updated_count
+

@@ -87,6 +87,15 @@ class TestManagementAPIs(unittest.TestCase):
         """Set up database connection and initial test users."""
         cls.db = SessionLocal()
 
+        # Clean up any leftover test data from aborted runs
+        cls.db.execute(employee_roles.delete())
+        cls.db.query(Employee).delete(synchronize_session=False)
+        cls.db.query(Department).delete(synchronize_session=False)
+        cls.db.execute(user_locations.delete())
+        cls.db.query(User).filter(User.email.like("%@test.internal")).delete()
+        cls.db.query(Location).filter(Location.name.in_(["HQ Campus", "East Coast Hub"])).delete(synchronize_session=False)
+        cls.db.commit()
+
         # Load bootstrap super_admin
         cls.super_admin = (
             cls.db.query(User).filter(User.email == "admin@cameraintelligence.com").first()

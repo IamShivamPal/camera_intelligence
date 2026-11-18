@@ -48,6 +48,7 @@ from app.api.v1.endpoints.events import (
     ingest_event as ingest_event_ep,
     list_events as list_events_ep,
     get_event_details as get_event_details_ep,
+    reconcile_sessions as reconcile_sessions_ep,
 )
 
 
@@ -623,6 +624,19 @@ class TestEventAPIs(unittest.TestCase):
             .count()
         )
         self.assertGreaterEqual(count, 5)
+
+    def test_17_reconcile_sessions_endpoint(self):
+        """17. POST /api/v1/events/reconcile-sessions closes eligible orphaned sessions."""
+        res = reconcile_sessions_ep(
+            current_user=self.operator_a,
+            db=self.db,
+            max_stale_seconds=900.0,
+            offline_camera_grace_seconds=60.0,
+            location_id=self.loc_a.id,
+        )
+        self.assertEqual(res["status"], "success")
+        self.assertIn("reconciled_sessions_count", res)
+        self.assertIn("reconciled_session_ids", res)
 
 
 if __name__ == "__main__":

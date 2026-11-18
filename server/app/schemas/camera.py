@@ -144,3 +144,23 @@ class CameraDetailResponse(CameraResponse):
     detection_event_count: int = 0
     alert_count: int = 0
 
+
+class CameraHeartbeat(BaseModel):
+    connection_status: str = Field(
+        ...,
+        pattern="^(online|offline|degraded|unknown)$",
+        description="Health / connectivity status reported by edge stream worker",
+    )
+    last_error: str | None = Field(None, max_length=500, description="Error message if stream is degraded/offline")
+    fps_captured: float | None = Field(None, ge=0.0, le=240.0, description="Observed ingest frame rate")
+    total_reconnects: int | None = Field(None, ge=0, description="Cumulative reconnect attempts")
+
+
+class CameraHeartbeatBatchItem(CameraHeartbeat):
+    camera_id: int = Field(..., description="ID of camera")
+
+
+class CameraHeartbeatBatch(BaseModel):
+    items: list[CameraHeartbeatBatchItem] = Field(..., max_length=100)
+
+
